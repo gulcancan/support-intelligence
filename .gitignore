@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+venv/
+.venv/
+data/raw/tickets_100k.json
+models/
+.vscode/
+.idea/
+mlruns/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
