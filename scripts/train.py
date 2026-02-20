@@ -45,11 +45,25 @@ def train_transformer(tr, val, te, model_dir, epochs=5, batch_size=32):
     return {"model":"transformer","val_f1":val_met.weighted_f1,"test_f1":te_met.weighted_f1,"latency_ms":round(sum(lats)/len(lats),1),"train_sec":round(tt)}
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--data",default="data/raw/tickets_100k.json")
+    p = argparse.ArgumentParser(); p.add_argument("--data",default="data/raw/tickets.json")
     p.add_argument("--catboost",action="store_true"); p.add_argument("--transformer",action="store_true")
     p.add_argument("--both",action="store_true"); p.add_argument("--optuna-trials",type=int,default=20)
     p.add_argument("--epochs",type=int,default=5); p.add_argument("--batch-size",type=int,default=32)
     p.add_argument("--model-dir",default="./models"); args = p.parse_args()
+
+    # Log hardware info
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            logger.info(f"GPU detected: {gpu_name} ({gpu_mem:.0f} GB)")
+            logger.info(f"CUDA version: {torch.version.cuda}")
+        else:
+            logger.info("No GPU detected — training on CPU")
+    except Exception:
+        logger.info("PyTorch not available for GPU check")
+
     if args.both: args.catboost = args.transformer = True
     if not args.catboost and not args.transformer: args.catboost = True
     tr, val, te = load_and_split(args.data); results = []

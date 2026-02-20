@@ -1,50 +1,74 @@
-.PHONY: help setup generate-data train-all serve test
+.PHONY: help setup infra ingest train-all serve test clean
 
 PYTHON := python3
-DATA := data/raw/tickets_100k.json
+DATA := data/raw/tickets.json
 
-help:
+help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
-setup: ## Install deps + generate data
+# ── Setup ──
+
+setup: ## Install Python dependencies
+	$(PYTHON) -m pip install torch --index-url https://download.pytorch.org/whl/cpu --break-system-packages 2>/dev/null || $(PYTHON) -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 	$(PYTHON) -m pip install -r requirements.txt --break-system-packages 2>/dev/null || $(PYTHON) -m pip install -r requirements.txt
-	$(MAKE) generate-data
+	@echo "✅ Dependencies installed. Place your ticket data at $(DATA)"
 
-generate-data: ## Generate 100k synthetic tickets
-	cd scripts && $(PYTHON) generate_data.py
+# ── Docker workflow (recommended) ──
 
-infra: ## Start PostgreSQL, Qdrant, MLflow
-	docker compose up -d postgres qdrant mlflow && sleep 10 && echo "✅ Infra ready"
+up: ## Start full stack (PostgreSQL, Qdrant, MLflow, API)
+	docker compose up -d
+	@echo "✅ Services starting. API: http://localhost:8000 | MLflow: http://localhost:5000"
 
-infra-down: ## Stop infrastructure
+down: ## Stop all services
 	docker compose down
 
-ingest: ## Load tickets into database
-	cd src && PYTHONPATH=. $(PYTHON) -c "from ingestion.pipeline import ingest; import json; print(json.dumps(ingest('../$(DATA)'),indent=2,default=str))"
+ingest-docker: ## Ingest 300K tickets (run once after 'up')
+	docker compose run --rm ingest
 
-index: ## Build retrieval index
-	cd src && PYTHONPATH=. $(PYTHON) -c "import json; from retrieval.fusion import HybridRetriever; r=HybridRetriever(); r.index_tickets(json.load(open('../$(DATA)')))"
+train-docker: ## Train both models inside Docker
+	docker compose run --rm train
 
-train-catboost: ## Train CatBoost
+# ── Local workflow ──
+
+infra: ## Start infrastructure only (PostgreSQL, Qdrant, MLflow)
+	docker compose up -d postgres qdrant mlflow
+	@echo "Waiting for services..." && sleep 10
+	@echo "✅ PostgreSQL:5432 | Qdrant:6333 | MLflow:5000"
+
+ingest: ## Ingest tickets into database + build retrieval index
+	cd src && PYTHONPATH=. $(PYTHON) ../scripts/run_ingest.py
+
+train-catboost: ## Train CatBoost classifier
 	cd src && PYTHONPATH=. $(PYTHON) ../scripts/train.py --data ../$(DATA) --catboost --model-dir ../models
 
-train-transformer: ## Train DistilBERT
+train-transformer: ## Train DistilBERT classifier
 	cd src && PYTHONPATH=. $(PYTHON) ../scripts/train.py --data ../$(DATA) --transformer --model-dir ../models
 
-train-all: ## Train both + compare
+train-all: ## Train both models and compare
 	cd src && PYTHONPATH=. $(PYTHON) ../scripts/train.py --data ../$(DATA) --both --model-dir ../models
 
-train-quick: ## Quick train (3 trials, 2 epochs)
+train-quick: ## Quick training (3 Optuna trials, 2 epochs)
 	cd src && PYTHONPATH=. $(PYTHON) ../scripts/train.py --data ../$(DATA) --both --optuna-trials 3 --epochs 2 --model-dir ../models
 
-serve: ## Start FastAPI server
+serve: ## Start FastAPI server locally
 	cd src && PYTHONPATH=. uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
-test: ## Run tests
+# ── Testing ──
+
+test: ## Run all tests
 	cd src && PYTHONPATH=. $(PYTHON) -m pytest ../tests/ -v
 
-test-api: ## Test API with curl
-	@curl -s http://localhost:8000/api/v1/health | python3 -m json.tool
+test-api: ## Test API endpoints with curl
+	@echo "=== Health ===" && curl -s http://localhost:8000/api/v1/health | python3 -m json.tool
+	@echo "\n=== Classify ===" && curl -s -X POST http://localhost:8000/api/v1/tickets/process \
+		-H "Content-Type: application/json" \
+		-d '{"subject":"Database sync failing","description":"ERROR_TIMEOUT_429 on large datasets","product":"DataSync Pro","priority":"high"}' \
+		| python3 -m json.tool
 
-clean: ## Remove generated files
-	rm -rf models/ data/raw/tickets_100k.json __pycache__
+# ── Cleanup ──
+
+clean: ## Remove trained models and caches
+	rm -rf models/ __pycache__ src/__pycache__ src/**/__pycache__
+
+clean-all: clean down ## Full cleanup including Docker volumes
+	docker compose down -v

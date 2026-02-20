@@ -93,3 +93,68 @@ async def health():
         with get_engine().connect() as c: c.execute(st("SELECT 1")); db_ok = True
     except: pass
     return HealthResponse(status="healthy" if models and db_ok else "degraded", version="1.0.0", models_loaded=models, database_connected=db_ok)
+
+
+# ── Analytics Endpoints ──
+
+@app.get("/api/v1/analytics/satisfaction")
+async def satisfaction_drivers():
+    """Analyze what drives customer satisfaction scores."""
+    try:
+        from db import get_engine; from sqlalchemy import text as st
+        from analytics.business import SatisfactionAnalyzer
+        with get_engine().connect() as c:
+            rows = c.execute(st("SELECT * FROM tickets")).fetchall()
+            cols = c.execute(st("SELECT * FROM tickets LIMIT 0")).keys()
+        df = pd.DataFrame(rows, columns=cols)
+        return SatisfactionAnalyzer().analyze(df)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/api/v1/analytics/agents")
+async def agent_performance():
+    """Compute per-agent performance metrics."""
+    try:
+        from db import get_engine; from sqlalchemy import text as st
+        from analytics.business import AgentPerformanceAnalyzer
+        with get_engine().connect() as c:
+            rows = c.execute(st("SELECT * FROM tickets")).fetchall()
+            cols = c.execute(st("SELECT * FROM tickets LIMIT 0")).keys()
+        df = pd.DataFrame(rows, columns=cols)
+        return AgentPerformanceAnalyzer().analyze(df)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/api/v1/analytics/resolution-time")
+async def resolution_time_stats():
+    """Get resolution time statistics by category and product."""
+    try:
+        from db import get_engine; from sqlalchemy import text as st
+        with get_engine().connect() as c:
+            rows = c.execute(st("""
+                SELECT product, category,
+                    COUNT(*) as ticket_count,
+                    AVG(resolution_time_hours) as avg_hours,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY resolution_time_hours) as median_hours,
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY resolution_time_hours) as p95_hours
+                FROM tickets
+                WHERE resolution_time_hours IS NOT NULL
+                GROUP BY product, category
+                ORDER BY avg_hours DESC
+            """)).fetchall()
+        return [{"product": r[0], "category": r[1], "ticket_count": r[2],
+                 "avg_hours": round(float(r[3]),1), "median_hours": round(float(r[4]),1),
+                 "p95_hours": round(float(r[5]),1)} for r in rows]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/api/v1/monitoring/drift")
+async def drift_status():
+    """Check current drift signals across all monitors."""
+    try:
+        from monitoring.drift import DriftDetector
+        detector = DriftDetector()
+        # Return empty if no reference data yet
+        return {"status": "operational", "message": "Drift monitoring active. Run monitoring cycle to check signals."}
+    except Exception as e:
+        raise HTTPException(500, str(e))

@@ -1,8 +1,13 @@
-# Support Intelligence System
-# Expects 300K ticket JSON file at: ./data/raw/tickets.json
+# ═══════════════════════════════════════════════════════════
+# docker-compose for DGX Spark (Grace Blackwell GPU)
+#
+# Usage:
+#   docker compose -f docker-compose.dgx.yml up -d
+#   docker compose -f docker-compose.dgx.yml run --rm ingest
+#   docker compose -f docker-compose.dgx.yml run --rm train
+# ═══════════════════════════════════════════════════════════
 
 services:
-  # ── Data Layer ──
   postgres:
     image: postgres:16-alpine
     environment:
@@ -19,24 +24,24 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:v1.9.1
     ports:
       - "6333:6333"
-      - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
-  # ── MLOps ──
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.12.1
     command: >
       mlflow server
-      --host 0.0.0.0
-      --port 5000
+      --host 0.0.0.0 --port 5000
       --backend-store-uri postgresql://support:support_pass@postgres:5432/support_intelligence
       --default-artifact-root /mlflow/artifacts
     ports:
@@ -46,13 +51,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
 
-  # ── Application ──
+  # ── GPU-enabled application ──
   app:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.dgx
     ports:
       - "8000:8000"
     environment:
@@ -69,16 +73,20 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
-      mlflow:
-        condition: service_started
-    restart: unless-stopped
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
-  # ── One-shot jobs (run via: docker compose run --rm ingest) ──
+  # ── Ingest job (no GPU needed) ──
   ingest:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.dgx
     command: python -m scripts.run_ingest
     environment:
       DATABASE_URL: postgresql://support:support_pass@postgres:5432/support_intelligence
@@ -92,15 +100,24 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
     profiles: ["tools"]
 
-  # Train models (run via: docker compose run --rm train)
+  # ── Training job (GPU-accelerated) ──
   train:
     build:
       context: .
-      dockerfile: Dockerfile
-    command: python -m scripts.train --data /app/data/raw/tickets.json --both --model-dir /app/models
+      dockerfile: Dockerfile.dgx
+    # DGX Spark: 128GB unified memory allows large batches
+    # --batch-size 128 is comfortable; try 256 if you want to push it
+    command: >
+      python -m scripts.train
+        --data /app/data/raw/tickets.json
+        --both
+        --optuna-trials 20
+        --epochs 5
+        --batch-size 128
+        --model-dir /app/models
     environment:
       DATABASE_URL: postgresql://support:support_pass@postgres:5432/support_intelligence
       QDRANT_HOST: qdrant
@@ -113,6 +130,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     profiles: ["tools"]
 
 volumes:

@@ -85,4 +85,87 @@ def ingest(json_path, db_url=None):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    print(json.dumps(ingest("data/raw/tickets_100k.json"), indent=2, default=str))
+    print(json.dumps(ingest("data/raw/tickets.json"), indent=2, default=str))
+
+
+def populate_graph_tables(tickets, engine=None):
+    """
+    Build graph tables: product_issues, issue_solutions, error_code_mapping.
+
+    These power the Graph-RAG component — structured knowledge about
+    which products have which issues and what resolutions work.
+    """
+    engine = engine or get_engine()
+    logger.info("Populating graph tables...")
+    df = pd.DataFrame(tickets)
+
+    # product_issues: product → category, frequency, avg resolution time
+    pi = df.groupby(["product", "category"]).agg(
+        frequency=("ticket_id", "count"),
+        avg_resolution_hrs=("resolution_time_hours", "mean"),
+    ).reset_index().rename(columns={"category": "issue_type"})
+
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM product_issues"))
+        for _, row in pi.iterrows():
+            conn.execute(text(
+                "INSERT INTO product_issues (product, issue_type, frequency, avg_resolution_hrs) "
+                "VALUES (:p, :i, :f, :a) ON CONFLICT (product, issue_type) DO UPDATE "
+                "SET frequency=EXCLUDED.frequency, avg_resolution_hrs=EXCLUDED.avg_resolution_hrs"
+            ), {"p": row["product"], "i": row["issue_type"], "f": int(row["frequency"]),
+                "a": float(row["avg_resolution_hrs"]) if pd.notna(row["avg_resolution_hrs"]) else None})
+
+    # issue_solutions: category + resolution_code → template, success rate
+    resolved = df[df["resolution_code"].notna() & df["resolution"].notna()]
+    if len(resolved) > 0:
+        iss = resolved.groupby(["category", "resolution_code"]).agg(
+            usage_count=("ticket_id", "count"),
+            success_rate=("resolution_helpful", "mean"),
+            resolution_template=("resolution", "first"),
+        ).reset_index().rename(columns={"category": "issue_type"})
+
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM issue_solutions"))
+            for _, row in iss.iterrows():
+                conn.execute(text(
+                    "INSERT INTO issue_solutions (issue_type, resolution_code, resolution_template, success_rate, usage_count) "
+                    "VALUES (:it, :rc, :rt, :sr, :uc) ON CONFLICT (issue_type, resolution_code) DO UPDATE "
+                    "SET success_rate=EXCLUDED.success_rate, usage_count=EXCLUDED.usage_count"
+                ), {"it": row["issue_type"], "rc": row["resolution_code"],
+                    "rt": str(row["resolution_template"])[:500],
+                    "sr": float(row["success_rate"]) if pd.notna(row["success_rate"]) else None,
+                    "uc": int(row["usage_count"])})
+
+    # error_code_mapping: error codes → product, issue, resolution
+    ec_rows = []
+    for _, t in df[df["error_logs"].notna()].iterrows():
+        codes = re.findall(r"ERROR_\w+", str(t.get("error_logs", "")))
+        for code in set(codes):
+            ec_rows.append({
+                "error_code": code, "product": t.get("product"),
+                "issue_type": t.get("category"), "resolution_code": t.get("resolution_code"),
+                "resolution_text": str(t.get("resolution", ""))[:500],
+            })
+
+    if ec_rows:
+        ec_df = pd.DataFrame(ec_rows)
+        ec_agg = ec_df.groupby(["error_code", "product", "issue_type"]).agg(
+            resolution_code=("resolution_code", "first"),
+            resolution_text=("resolution_text", "first"),
+            occurrences=("error_code", "count"),
+        ).reset_index()
+
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM error_code_mapping"))
+            for _, row in ec_agg.iterrows():
+                conn.execute(text(
+                    "INSERT INTO error_code_mapping (error_code, product, issue_type, resolution_code, resolution_text, occurrences) "
+                    "VALUES (:ec, :p, :it, :rc, :rt, :oc) ON CONFLICT (error_code, product, issue_type) DO UPDATE "
+                    "SET occurrences=EXCLUDED.occurrences"
+                ), {"ec": row["error_code"], "p": row["product"], "it": row["issue_type"],
+                    "rc": row.get("resolution_code"), "rt": str(row.get("resolution_text", ""))[:500],
+                    "oc": int(row["occurrences"])})
+
+    logger.info(f"Graph tables populated: {len(pi)} product-issues, "
+                f"{len(iss) if len(resolved) > 0 else 0} issue-solutions, "
+                f"{len(ec_agg) if ec_rows else 0} error-code mappings")

@@ -2,4 +2,3 @@
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-v --tb=short"
-
