@@ -9,7 +9,13 @@ Usage:
 import json
 import logging
 import sys
+import os
 from pathlib import Path
+
+# Ensure /app/src is on the path — NVIDIA base image entrypoint can override PYTHONPATH
+_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)

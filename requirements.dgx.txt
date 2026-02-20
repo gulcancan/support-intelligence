@@ -1,0 +1,38 @@
+# ── API ──
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+
+# ── Database ──
+sqlalchemy>=2.0.29
+psycopg2-binary>=2.9.9
+
+# ── ML (classical) ──
+scikit-learn>=1.4.1
+catboost>=1.2.3
+optuna>=3.6.0
+
+# ── ML (deep learning) — torch already in NVIDIA base image ──
+# Pin these to versions compatible with NVIDIA's PyTorch 2.4.0a0 (nv24.05)
+transformers==4.41.2
+sentence-transformers==2.7.0
+
+# ── Data ──
+pandas>=2.2.1
+numpy>=1.26.4
+
+# ── Retrieval ──
+qdrant-client>=1.8.0,<1.10.0
+rank-bm25>=0.2.2
+
+# ── MLOps ──
+mlflow>=2.12.1
+joblib>=1.3.2
+
+# ── Utilities ──
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+
+# ── Testing ──
+pytest>=8.0.0

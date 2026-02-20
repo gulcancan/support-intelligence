@@ -4,11 +4,10 @@
 # Uses NVIDIA PyTorch base image with CUDA pre-installed.
 # Trains DistilBERT on GPU with large batch sizes.
 # ═══════════════════════════════════════════════════════════
-
 FROM nvcr.io/nvidia/pytorch:24.05-py3
 
 # The NVIDIA image already includes:
-#   - Python 3.10, PyTorch 2.4+ with CUDA, cuDNN, NCCL
+#   - Python 3.10, PyTorch 2.4.0a0 with CUDA, cuDNN, NCCL
 #   - ~15GB image, but everything GPU-related is pre-built and optimized
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -17,9 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install remaining Python deps (torch is already in the base image)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Use DGX-specific requirements with pinned transformers/sentence-transformers
+# compatible with NVIDIA's PyTorch 2.4.0a0 (nv24.05 build)
+COPY requirements.dgx.txt .
+RUN pip install --no-cache-dir -r requirements.dgx.txt
 
 # Copy application code
 COPY src/ src/

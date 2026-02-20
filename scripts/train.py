@@ -1,6 +1,12 @@
 """Train classifiers, log to MLflow, compare."""
-import argparse, json, logging, time
+import argparse, json, logging, time, sys, os
 from pathlib import Path
+
+# Ensure /app/src is on the path — the NVIDIA base image entrypoint can override PYTHONPATH
+_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
 import pandas as pd
 from config import get_settings
 
