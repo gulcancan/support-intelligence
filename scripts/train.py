@@ -33,13 +33,13 @@ def train_catboost(tr, val, te, model_dir, n_trials=20):
     logger.info(f"CatBoost: val_f1={val_met.weighted_f1}, test_f1={te_met.weighted_f1}, latency={sum(lats)/len(lats):.1f}ms, train={tt:.0f}s")
     return {"model":"catboost","val_f1":val_met.weighted_f1,"test_f1":te_met.weighted_f1,"latency_ms":round(sum(lats)/len(lats),1),"train_sec":round(tt)}
 
-def train_transformer(tr, val, te, model_dir, epochs=5, batch_size=32):
+def train_transformer(tr, val, te, model_dir, epochs=5, batch_size=32, model_key=None):
     from models.transformer_classifier import TransformerTicketClassifier
     from models.common import evaluate_model
     import torch, numpy as np
     from torch.utils.data import DataLoader
     from models.transformer_classifier import TicketDataset
-    m = TransformerTicketClassifier(model_dir=model_dir)
+    m = TransformerTicketClassifier(model_dir=model_dir, model_key=model_key)
     t0 = time.time(); val_met = m.train(tr, val, epochs=epochs, batch_size=batch_size); tt = time.time()-t0
     y_te = m.label_encoder.transform(te["category"])
     te_ds = TicketDataset(m._get_texts(te), m._prepare_structured(te), y_te, m.tokenizer, m.max_length)
@@ -47,14 +47,16 @@ def train_transformer(tr, val, te, model_dir, epochs=5, batch_size=32):
     te_met = evaluate_model(y_te, y_pred, list(m.label_encoder.classes_))
     sample = te.iloc[0].to_dict(); lats = [m.predict(sample).latency_ms for _ in range(20)]
     m.save(model_dir)
-    logger.info(f"Transformer: val_f1={val_met.weighted_f1}, test_f1={te_met.weighted_f1}, latency={sum(lats)/len(lats):.1f}ms, train={tt:.0f}s")
-    return {"model":"transformer","val_f1":val_met.weighted_f1,"test_f1":te_met.weighted_f1,"latency_ms":round(sum(lats)/len(lats),1),"train_sec":round(tt)}
+    mname = m.model_name.split("/")[-1]
+    logger.info(f"{mname}: val_f1={val_met.weighted_f1}, test_f1={te_met.weighted_f1}, latency={sum(lats)/len(lats):.1f}ms, train={tt:.0f}s")
+    return {"model":mname,"val_f1":val_met.weighted_f1,"test_f1":te_met.weighted_f1,"latency_ms":round(sum(lats)/len(lats),1),"train_sec":round(tt)}
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--data",default="data/raw/tickets.json")
     p.add_argument("--catboost",action="store_true"); p.add_argument("--transformer",action="store_true")
     p.add_argument("--both",action="store_true"); p.add_argument("--optuna-trials",type=int,default=20)
     p.add_argument("--epochs",type=int,default=5); p.add_argument("--batch-size",type=int,default=32)
+    p.add_argument("--model-key",default=None,help="Transformer model: modernbert (default), distilbert, deberta-small, modernbert-large")
     p.add_argument("--model-dir",default="./models"); args = p.parse_args()
 
     # Log hardware info
@@ -67,14 +69,14 @@ def main():
             logger.info(f"CUDA version: {torch.version.cuda}")
         else:
             logger.info("No GPU detected — training on CPU")
-    except Exception:
-        logger.info("PyTorch not available for GPU check")
+    except Exception as e:
+        logger.info(f"GPU check failed: {e} — will detect at training time")
 
     if args.both: args.catboost = args.transformer = True
     if not args.catboost and not args.transformer: args.catboost = True
     tr, val, te = load_and_split(args.data); results = []
     if args.catboost: results.append(train_catboost(tr,val,te,f"{args.model_dir}/catboost",args.optuna_trials))
-    if args.transformer: results.append(train_transformer(tr,val,te,f"{args.model_dir}/transformer",args.epochs,args.batch_size))
+    if args.transformer: results.append(train_transformer(tr,val,te,f"{args.model_dir}/transformer",args.epochs,args.batch_size,args.model_key))
     if len(results)>1:
         logger.info("\n" + "="*60 + "\nCOMPARISON\n" + "="*60)
         logger.info(f"\n{pd.DataFrame(results).to_string(index=False)}")

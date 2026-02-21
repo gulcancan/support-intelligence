@@ -72,35 +72,51 @@ subject + " [SEP] " + description
 **Why [CLS] + structured features (not text-only):**
 A pure text model ignores valuable metadata. A ticket saying "this is broken" means very different things depending on whether `customer_tier=enterprise` and `priority=critical` vs `customer_tier=free` and `priority=low`. The concatenation architecture captures both.
 
-**Why freeze bottom 4/6 layers:**
-- Reduces trainable parameters from 66M to ~15M
+**Why freeze bottom 50% of encoder layers:**
+- Reduces trainable parameters significantly
 - Prevents catastrophic forgetting of pre-trained representations
 - Bottom layers capture general syntax; top layers adapt to task
-- 3× faster training with negligible quality loss
+- 2-3× faster training with negligible quality loss
 
 **Training configuration:**
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | Optimizer | AdamW | Weight decay regularization |
-| Learning rate | 2e-5 | Standard for BERT fine-tuning |
+| Learning rate | 2e-5 | Standard for encoder fine-tuning |
 | Warmup | 10% of steps | Prevents early gradient explosions |
 | Schedule | Linear decay | Gradual learning rate reduction |
-| Batch size | 32 | Balance memory usage and gradient quality |
+| Batch size | 32-128 | Larger on GPU (128 on DGX Spark) |
 | Max epochs | 5 | Early stopping usually triggers at 3-4 |
 | Patience | 2 epochs | Stop if no F1 improvement |
-| Max length | 128 tokens | Covers 95%+ of ticket text |
+| Max length | 512 tokens | ModernBERT supports up to 8192 |
 | Gradient clipping | 1.0 | Stabilizes training |
 
-### Why DistilBERT over BERT/RoBERTa
+### Why ModernBERT over DistilBERT/BERT/RoBERTa
 
-| Model | Params | Inference (CPU) | F1 Delta |
-|-------|--------|-----------------|----------|
-| BERT-base | 110M | ~300ms | baseline |
-| DistilBERT | 66M | ~150ms | -0.5% |
-| RoBERTa | 125M | ~350ms | +0.3% |
+| Model | Params | Context | Architecture | Inference | Notes |
+|-------|--------|---------|--------------|-----------|-------|
+| DistilBERT | 66M | 512 | Distilled BERT (2019) | ~150ms | Outdated, no longer SOTA |
+| BERT-base | 110M | 512 | Original (2018) | ~300ms | Baseline |
+| RoBERTa | 125M | 512 | Improved BERT (2019) | ~350ms | Better pretraining |
+| DeBERTa-v3-small | 44M | 512 | Disentangled attention | ~120ms | Good for small footprint |
+| **ModernBERT-base** | **149M** | **8192** | **Rotary PE, GeGLU, Flash Attn** | **~100ms** | **Best 2024+ choice** |
+| ModernBERT-large | 395M | 8192 | Same, larger | ~250ms | When accuracy is paramount |
 
-For ticket classification (short text, 7 classes), the marginal quality gain of RoBERTa doesn't justify 2× slower inference. DistilBERT is the Pareto-optimal choice.
+ModernBERT (Answer.AI, 2024) is the clear successor. Key advantages over DistilBERT:
+- **Rotary positional embeddings** (RoPE) — better position encoding, generalizes to longer sequences
+- **GeGLU activations** — improved gradient flow vs GELU
+- **Flash Attention** — 2× memory efficiency, native in modern PyTorch
+- **8192 token context** — handles long tickets without truncation
+- **Better pretraining** — trained on more diverse, recent data
+- **Comparable speed** — despite 2× more parameters, modern optimizations make it ~equally fast
+
+The model can be swapped via `--model-key`:
+```bash
+python -m scripts.train --transformer --model-key modernbert      # default
+python -m scripts.train --transformer --model-key distilbert      # legacy
+python -m scripts.train --transformer --model-key deberta-small   # lightweight
+```
 
 ---
 
@@ -108,13 +124,13 @@ For ticket classification (short text, 7 classes), the marginal quality gain of 
 
 ### Performance Metrics
 
-| Metric | CatBoost | DistilBERT | Notes |
+| Metric | CatBoost | ModernBERT | Notes |
 |--------|----------|------------|-------|
-| Val Weighted F1 | ~0.88-0.92 | ~0.89-0.93 | Transformer slightly better |
-| Val Macro F1 | ~0.84-0.88 | ~0.86-0.90 | Larger gap on minority classes |
-| Test Weighted F1 | ~0.87-0.91 | ~0.88-0.92 | Temporal test set |
-| Inference latency | 1-5 ms | 50-200 ms | CatBoost 10-40× faster |
-| Training time | ~5 min | ~30 min | With Optuna / 5 epochs |
+| Val Weighted F1 | ~0.88-0.92 | ~0.90-0.94 | Transformer slightly better |
+| Val Macro F1 | ~0.84-0.88 | ~0.87-0.91 | Larger gap on minority classes |
+| Test Weighted F1 | ~0.87-0.91 | ~0.89-0.93 | Temporal test set |
+| Inference latency | 1-5 ms | 50-150 ms | CatBoost 10-30× faster |
+| Training time | ~5 min | ~15-30 min | With Optuna / 5 epochs |
 
 *Exact numbers depend on Optuna trial results and random seed.*
 
@@ -123,10 +139,11 @@ For ticket classification (short text, 7 classes), the marginal quality gain of 
 | Scenario | Best Model | Why |
 |----------|-----------|-----|
 | Production default | CatBoost | Fast, interpretable, easy to deploy |
-| High-throughput (>100 tickets/sec) | CatBoost | 1-5ms vs 50-200ms |
+| High-throughput (>100 tickets/sec) | CatBoost | 1-5ms vs 50-150ms |
 | Stakeholder explanations | CatBoost | SHAP values, feature importances |
-| Rich text, sparse metadata | DistilBERT | Better text generalization |
-| New/unseen product names | DistilBERT | Handles OOV via subword tokenization |
+| Rich text, sparse metadata | ModernBERT | Better text generalization |
+| New/unseen product names | ModernBERT | Handles OOV via subword tokenization |
+| Long ticket descriptions | ModernBERT | 8192 token context vs 512 TF-IDF |
 | Low-confidence predictions | Ensemble | Average probabilities for robustness |
 
 ### Ensemble Strategy

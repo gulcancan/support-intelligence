@@ -100,7 +100,7 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
     profiles: ["tools"]
 
   # ── Training job (GPU-accelerated) ──
