@@ -31,6 +31,11 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.12.1
@@ -55,7 +60,6 @@ services:
     ports:
       - "8000:8000"
     environment:
-      PYTHONPATH: /app/src
       DATABASE_URL: postgresql://support:support_pass@postgres:5432/support_intelligence
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
@@ -69,7 +73,7 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -85,7 +89,6 @@ services:
       dockerfile: Dockerfile.dgx
     command: python -m scripts.run_ingest
     environment:
-      PYTHONPATH: /app/src
       DATABASE_URL: postgresql://support:support_pass@postgres:5432/support_intelligence
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
@@ -116,7 +119,6 @@ services:
         --batch-size 128
         --model-dir /app/models
     environment:
-      PYTHONPATH: /app/src
       DATABASE_URL: postgresql://support:support_pass@postgres:5432/support_intelligence
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"

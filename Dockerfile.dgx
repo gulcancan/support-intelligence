@@ -1,14 +1,17 @@
 # ═══════════════════════════════════════════════════════════
-# Dockerfile for NVIDIA DGX Spark (Grace Blackwell, 128GB unified memory)
+# Dockerfile for NVIDIA DGX Spark (Grace Blackwell GB10)
 #
-# Uses NVIDIA PyTorch base image with CUDA pre-installed.
-# Trains DistilBERT on GPU with large batch sizes.
+# Base: nvcr.io/nvidia/pytorch:25.11-py3
+#   - Python 3.12, PyTorch 2.10.0a0, CUDA 13.0
+#   - Native Blackwell (sm_121 / GB10 / B200) support
+#   - This is the NVIDIA-recommended container for DGX Spark
+#     https://build.nvidia.com/spark/unsloth/instructions
+#
+# Note: Starting from 25.03, NVIDIA containers include
+#   /etc/pip/constraint.txt that pins package versions.
+#   We remove constraints for packages we need to install fresh.
 # ═══════════════════════════════════════════════════════════
-FROM nvcr.io/nvidia/pytorch:24.05-py3
-
-# The NVIDIA image already includes:
-#   - Python 3.10, PyTorch 2.4.0a0 with CUDA, cuDNN, NCCL
-#   - ~15GB image, but everything GPU-related is pre-built and optimized
+FROM nvcr.io/nvidia/pytorch:25.11-py3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev curl && \
@@ -16,10 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Use DGX-specific requirements with pinned transformers/sentence-transformers
-# compatible with NVIDIA's PyTorch 2.4.0a0 (nv24.05 build)
+# Remove pip constraints for packages we need to install/upgrade.
+# The NVIDIA constraint file prevents pip from installing newer versions.
 COPY requirements.dgx.txt .
-RUN pip install --no-cache-dir -r requirements.dgx.txt
+RUN if [ -f /etc/pip/constraint.txt ]; then \
+        sed -i '/transformers/d; /sentence.transformers/d; /scikit.learn/d; /fastapi/d; /uvicorn/d; /pydantic/d; /sqlalchemy/d; /mlflow/d; /optuna/d; /pandas/d; /numpy/d' \
+        /etc/pip/constraint.txt; \
+    fi && \
+    pip install --no-cache-dir -r requirements.dgx.txt
 
 # Copy application code
 COPY src/ src/
@@ -27,8 +34,6 @@ COPY scripts/ scripts/
 
 ENV PYTHONPATH=/app/src
 ENV PYTHONUNBUFFERED=1
-
-# Allow PyTorch to see the GPU
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 

@@ -1,3 +1,11 @@
+# requirements.dgx.txt
+# For: nvcr.io/nvidia/pytorch:25.11-py3
+#   Python 3.12, PyTorch 2.10.0a0, CUDA 13, Blackwell (GB10/B200) native
+#
+# torch is pre-installed in the base image — do NOT include it here.
+# Starting from 25.03, NVIDIA uses /etc/pip/constraint.txt to prevent
+# accidental overwrites. We work within those constraints.
+
 # ── API ──
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
@@ -13,17 +21,17 @@ scikit-learn>=1.4.1
 catboost>=1.2.3
 optuna>=3.6.0
 
-# ── ML (deep learning) — torch already in NVIDIA base image ──
-# Pin these to versions compatible with NVIDIA's PyTorch 2.4.0a0 (nv24.05)
-transformers==4.41.2
-sentence-transformers==2.7.0
+# ── ML (deep learning) — torch 2.10.0a0 is in the base image ──
+# transformers 4.56.0 is known to work with 25.11 (per NVIDIA's TRT-LLM notes)
+transformers>=4.50.0
+sentence-transformers>=3.4.0
 
 # ── Data ──
 pandas>=2.2.1
 numpy>=1.26.4
 
 # ── Retrieval ──
-qdrant-client>=1.8.0,<1.10.0
+qdrant-client>=1.8.0
 rank-bm25>=0.2.2
 
 # ── MLOps ──
