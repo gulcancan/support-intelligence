@@ -6,7 +6,7 @@ build/
 .env
 venv/
 .venv/
-data/raw/tickets_100k.json
+data/raw/tickets.json
 models/
 .vscode/
 .idea/

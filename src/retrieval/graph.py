@@ -21,5 +21,22 @@ class GraphRetriever:
         with self.engine.connect() as c: rows = c.execute(q, params).fetchall()
         return [{"error_code":r[0],"product":r[1],"issue_type":r[2],"resolution_code":r[3],"resolution_text":r[4],"occurrences":r[5]} for r in rows]
 
-    def get_related_context(self, product, category, error_codes=None):
-        return {"resolution_templates":self.get_product_resolutions(product,category),"error_code_resolutions":self.get_error_code_resolutions(error_codes or [],product),"product_stats":{}}
+    def get_related_context(self, product, category, error_codes=None, subcategory=None):
+        templates = self.get_product_resolutions(product, category)
+        # If we have a subcategory, filter templates to the most relevant ones
+        if subcategory and templates:
+            # Prefer resolutions whose template text mentions the subcategory concept
+            subcat_lower = subcategory.lower().replace("_", " ").replace("/", " ")
+            scored = []
+            for t in templates:
+                text = (t.get("resolution_template") or "").lower()
+                # Boost if template relates to subcategory
+                boost = 1.5 if subcat_lower in text else 1.0
+                scored.append((t, t.get("success_rate", 0) * boost))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            templates = [t for t, _ in scored]
+        return {
+            "resolution_templates": templates,
+            "error_code_resolutions": self.get_error_code_resolutions(error_codes or [], product),
+            "product_stats": {},
+        }

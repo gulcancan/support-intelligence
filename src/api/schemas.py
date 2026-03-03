@@ -21,11 +21,17 @@ class TicketInput(BaseModel):
 
 class ClassificationResponse(BaseModel):
     predicted_category: str; predicted_subcategory: Optional[str] = None
-    confidence: float; category_probabilities: dict; model_name: str; latency_ms: float
+    predicted_priority: Optional[str] = None; predicted_sentiment: Optional[str] = None
+    confidence: float; category_probabilities: dict
+    subcategory_probabilities: Optional[dict] = None
+    priority_probabilities: Optional[dict] = None
+    sentiment_probabilities: Optional[dict] = None
+    model_name: str; latency_ms: float
 
 class RetrievalResult(BaseModel):
     ticket_id: Optional[str] = None; resolution: Optional[str] = None; resolution_code: Optional[str] = None
     score: Optional[float] = None; final_score: Optional[float] = None; category: Optional[str] = None
+    subcategory: Optional[str] = None; priority: Optional[str] = None
     product: Optional[str] = None; subject: Optional[str] = None
 
 class GraphContext(BaseModel):

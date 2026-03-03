@@ -24,32 +24,91 @@ def load_and_split(path):
 def train_catboost(tr, val, te, model_dir, n_trials=20):
     from models.catboost_classifier import CatBoostTicketClassifier
     from models.common import evaluate_model
+    from sklearn.metrics import f1_score as _f1
+
     m = CatBoostTicketClassifier(model_dir=model_dir)
-    t0 = time.time(); val_met = m.train(tr, val, n_trials=n_trials); tt = time.time()-t0
-    y_te = m.label_encoder.transform(te["category"]); y_pred = m.label_encoder.transform(m.predict_batch(te))
-    te_met = evaluate_model(y_te, y_pred, list(m.label_encoder.classes_))
-    sample = te.iloc[0].to_dict(); lats = [m.predict(sample).latency_ms for _ in range(50)]
+    t0 = time.time()
+    val_met = m.train(tr, val, n_trials=n_trials)
+    tt = time.time() - t0
+
+    # Test set evaluation — multi-task
+    te_preds = m.predict_batch(te)
+    test_task_f1 = {}
+    for task_name, le in m.label_encoders.items():
+        col = m.tasks[task_name]["column"]
+        if col in te.columns and f"pred_{task_name}" in te_preds.columns:
+            y_true = le.transform(te[col].fillna("UNKNOWN"))
+            y_pred = le.transform(te_preds[f"pred_{task_name}"])
+            test_task_f1[task_name] = round(_f1(y_true, y_pred, average="weighted"), 4)
+
+    # Latency
+    sample = te.iloc[0].to_dict()
+    lats = [m.predict(sample).latency_ms for _ in range(50)]
     m.save(model_dir)
-    logger.info(f"CatBoost: val_f1={val_met.weighted_f1}, test_f1={te_met.weighted_f1}, latency={sum(lats)/len(lats):.1f}ms, train={tt:.0f}s")
-    return {"model":"catboost","val_f1":val_met.weighted_f1,"test_f1":te_met.weighted_f1,"latency_ms":round(sum(lats)/len(lats),1),"train_sec":round(tt)}
+
+    logger.info(f"\n{'='*60}\nCATBOOST MULTI-TASK RESULTS\n{'='*60}")
+    logger.info(f"Training time: {tt:.0f}s, Inference latency: {sum(lats)/len(lats):.1f}ms")
+    for task, f1 in test_task_f1.items():
+        n_cls = len(m.label_encoders[task].classes_)
+        logger.info(f"  {task:15s}  test_f1={f1:.4f}  ({n_cls} classes)")
+
+    return {
+        "model": "catboost",
+        "val_cat_f1": val_met.weighted_f1,
+        **{f"test_{t}_f1": f for t, f in test_task_f1.items()},
+        "latency_ms": round(sum(lats) / len(lats), 1),
+        "train_sec": round(tt),
+    }
 
 def train_transformer(tr, val, te, model_dir, epochs=5, batch_size=32, model_key=None):
     from models.transformer_classifier import TransformerTicketClassifier
     from models.common import evaluate_model
     import torch, numpy as np
     from torch.utils.data import DataLoader
-    from models.transformer_classifier import TicketDataset
+
     m = TransformerTicketClassifier(model_dir=model_dir, model_key=model_key)
-    t0 = time.time(); val_met = m.train(tr, val, epochs=epochs, batch_size=batch_size); tt = time.time()-t0
-    y_te = m.label_encoder.transform(te["category"])
-    te_ds = TicketDataset(m._get_texts(te), m._prepare_structured(te), y_te, m.tokenizer, m.max_length)
-    te_dl = DataLoader(te_ds, batch_size=64); y_pred = m._predict_batch_internal(te_dl)
-    te_met = evaluate_model(y_te, y_pred, list(m.label_encoder.classes_))
-    sample = te.iloc[0].to_dict(); lats = [m.predict(sample).latency_ms for _ in range(20)]
+    t0 = time.time()
+    val_met = m.train(tr, val, epochs=epochs, batch_size=batch_size)
+    tt = time.time() - t0
+
+    # Test set evaluation — use predict_batch for multi-task
+    te_preds = m.predict_batch(te)
+    te_cat_met = evaluate_model(
+        m.label_encoders["category"].transform(te["category"]),
+        m.label_encoders["category"].transform(te_preds["pred_category"]),
+        list(m.label_encoders["category"].classes_),
+    )
+
+    # Per-task test F1
+    from sklearn.metrics import f1_score as _f1
+    test_task_f1 = {}
+    for task_name, le in m.label_encoders.items():
+        col = m.tasks[task_name]["column"]
+        if col in te.columns and f"pred_{task_name}" in te_preds.columns:
+            y_true = le.transform(te[col].fillna("UNKNOWN"))
+            y_pred = le.transform(te_preds[f"pred_{task_name}"])
+            test_task_f1[task_name] = round(_f1(y_true, y_pred, average="weighted"), 4)
+
+    # Latency
+    sample = te.iloc[0].to_dict()
+    lats = [m.predict(sample).latency_ms for _ in range(20)]
     m.save(model_dir)
+
     mname = m.model_name.split("/")[-1]
-    logger.info(f"{mname}: val_f1={val_met.weighted_f1}, test_f1={te_met.weighted_f1}, latency={sum(lats)/len(lats):.1f}ms, train={tt:.0f}s")
-    return {"model":mname,"val_f1":val_met.weighted_f1,"test_f1":te_met.weighted_f1,"latency_ms":round(sum(lats)/len(lats),1),"train_sec":round(tt)}
+    logger.info(f"\n{'='*60}\n{mname} MULTI-TASK RESULTS\n{'='*60}")
+    logger.info(f"Training time: {tt:.0f}s, Inference latency: {sum(lats)/len(lats):.1f}ms")
+    for task, f1 in test_task_f1.items():
+        n_cls = len(m.label_encoders[task].classes_)
+        logger.info(f"  {task:15s}  test_f1={f1:.4f}  ({n_cls} classes)")
+
+    return {
+        "model": mname,
+        "val_cat_f1": val_met.weighted_f1,
+        "test_cat_f1": te_cat_met.weighted_f1,
+        **{f"test_{t}_f1": f for t, f in test_task_f1.items()},
+        "latency_ms": round(sum(lats) / len(lats), 1),
+        "train_sec": round(tt),
+    }
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--data",default="data/raw/tickets.json")

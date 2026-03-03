@@ -44,18 +44,21 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def process_ticket(ticket: TicketInput):
     start = time.time(); td = ticket.model_dump()
     if td.get("ticket_text_length") is None: td["ticket_text_length"] = len(td.get("description",""))
-    clf = None; pred_cat = None
+    clf = None; pred_cat = None; pred_subcat = None; pred_pri = None; pred_sent = None
     if model_registry and model_registry.list_models():
         try:
             r = model_registry.predict(td)
-            clf = ClassificationResponse(predicted_category=r.predicted_category, predicted_subcategory=r.predicted_subcategory, confidence=r.confidence, category_probabilities=r.category_probabilities, model_name=r.model_name, latency_ms=r.latency_ms)
+            clf = ClassificationResponse(predicted_category=r.predicted_category, predicted_subcategory=r.predicted_subcategory, predicted_priority=getattr(r,"predicted_priority",None), predicted_sentiment=getattr(r,"predicted_sentiment",None), confidence=r.confidence, category_probabilities=r.category_probabilities, subcategory_probabilities=getattr(r,"subcategory_probabilities",None), priority_probabilities=getattr(r,"priority_probabilities",None), sentiment_probabilities=getattr(r,"sentiment_probabilities",None), model_name=r.model_name, latency_ms=r.latency_ms)
             pred_cat = r.predicted_category
+            pred_subcat = getattr(r, "predicted_subcategory", None)
+            pred_pri = getattr(r, "predicted_priority", None)
+            pred_sent = getattr(r, "predicted_sentiment", None)
         except Exception as e: logger.error(f"Classification failed: {e}")
     if clf is None: clf = ClassificationResponse(predicted_category="Unknown", confidence=0.0, category_probabilities={}, model_name="fallback", latency_ms=0.0)
     ret = RetrievalResponse(results=[], graph_context=GraphContext(), metadata={})
     if retriever:
         try:
-            rr = retriever.retrieve(td, predicted_category=pred_cat, top_k=5)
+            rr = retriever.retrieve(td, predicted_category=pred_cat, predicted_subcategory=pred_subcat, predicted_priority=pred_pri, predicted_sentiment=pred_sent, top_k=5)
             ret = RetrievalResponse(results=[RetrievalResult(**r) for r in rr["results"]], graph_context=GraphContext(**rr.get("graph_context",{})), metadata=rr.get("metadata",{}))
         except Exception as e: logger.error(f"Retrieval failed: {e}")
     return TicketProcessingResponse(ticket_id=ticket.ticket_id, classification=clf, retrieval=ret, processing_time_ms=round((time.time()-start)*1000,2))
@@ -65,7 +68,7 @@ async def classify_ticket(ticket: TicketInput, strategy: str = Query("auto")):
     if not model_registry or not model_registry.list_models(): raise HTTPException(503, "No models")
     td = ticket.model_dump(); td.setdefault("ticket_text_length", len(td.get("description","")))
     r = model_registry.predict(td, strategy=strategy)
-    return ClassificationResponse(predicted_category=r.predicted_category, predicted_subcategory=r.predicted_subcategory, confidence=r.confidence, category_probabilities=r.category_probabilities, model_name=r.model_name, latency_ms=r.latency_ms)
+    return ClassificationResponse(predicted_category=r.predicted_category, predicted_subcategory=r.predicted_subcategory, predicted_priority=getattr(r,"predicted_priority",None), predicted_sentiment=getattr(r,"predicted_sentiment",None), confidence=r.confidence, category_probabilities=r.category_probabilities, subcategory_probabilities=getattr(r,"subcategory_probabilities",None), priority_probabilities=getattr(r,"priority_probabilities",None), sentiment_probabilities=getattr(r,"sentiment_probabilities",None), model_name=r.model_name, latency_ms=r.latency_ms)
 
 @app.post("/api/v1/feedback")
 async def submit_feedback(fb: FeedbackInput):
