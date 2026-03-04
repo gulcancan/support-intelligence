@@ -1,18 +1,21 @@
 """
-Hybrid retrieval: Vector + BM25 + Graph, fused via RRF.
+Hybrid retrieval with dual-representation strategy.
 
-Now uses multi-task classification outputs to improve retrieval:
+Dual representation:
+  - BM25 indexes ORIGINAL text (preserves error codes, version numbers, exact tokens)
+  - Vector search indexes CLEANED text (better semantic embeddings after noise removal)
+  - Resolutions are cleaned at INDEX TIME (one-time cost, not per-query)
+
+At query time:
+  - BM25 searches on original query text (exact keyword matching)
+  - Vector search uses cleaned query text (semantic similarity)
+  - Both are fused via RRF, then re-ranked using classification predictions
+
+Classification-aware re-ranking:
   - category    → filters vector/BM25 search to same category
-  - subcategory → boosts results matching same subcategory
-  - priority    → boosts results from similar priority tickets (high→critical)
-  - sentiment   → boosts results that resolved similar sentiment tickets successfully
-
-The flow is:
-  1. Vector search (Qdrant) — filtered by category + product
-  2. BM25 keyword search — filtered by category, boosted by subcategory match
-  3. Graph-RAG — uses category + subcategory for resolution templates
-  4. RRF fusion — parameter-free rank merging
-  5. Classification-aware re-ranking — boost by subcategory, priority, resolution quality
+  - subcategory → boosts results matching same subcategory (1.8×)
+  - priority    → priority proximity scoring via adjacency matrix
+  - sentiment   → boosts high-satisfaction resolutions for frustrated customers
 """
 import re, logging
 from typing import Optional
@@ -21,6 +24,7 @@ from retrieval.embeddings import EmbeddingService
 from retrieval.vector_store import VectorStore
 from retrieval.bm25 import BM25Search
 from retrieval.graph import GraphRetriever
+from retrieval.text_cleaning import clean_ticket_text, clean_resolution_text
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +50,6 @@ def extract_error_codes(text):
     return list(set(re.findall(r"ERROR_\w+", text or "")))
 
 
-# Priority adjacency — tickets with "nearby" priority are still relevant
 PRIORITY_ADJACENCY = {
     "critical": {"critical": 1.0, "high": 0.7, "medium": 0.3, "low": 0.1},
     "high":     {"critical": 0.7, "high": 1.0, "medium": 0.5, "low": 0.2},
@@ -65,27 +68,23 @@ class HybridRetriever:
 
     def retrieve(self, ticket, predicted_category=None, predicted_subcategory=None,
                  predicted_priority=None, predicted_sentiment=None, top_k=5, use_graph=True):
-        """
-        Retrieve relevant past resolutions using classification predictions.
-
-        Args:
-            ticket: dict with ticket fields
-            predicted_category: e.g. "Technical Issue"
-            predicted_subcategory: e.g. "Configuration"
-            predicted_priority: e.g. "high"
-            predicted_sentiment: e.g. "frustrated"
-            top_k: number of results to return
-            use_graph: whether to query the knowledge graph
-        """
-        query = f"{ticket.get('subject', '')} {ticket.get('description', '')}"
+        """Retrieve using dual representation: original for BM25, cleaned for vectors."""
+        raw_subject = ticket.get("subject", "")
+        raw_desc = ticket.get("description", "")
         product = ticket.get("product")
-        ec = extract_error_codes(f"{ticket.get('description', '')} {ticket.get('error_logs', '')}")
+        ec = extract_error_codes(f"{raw_desc} {ticket.get('error_logs', '')}")
+
+        # Original text for BM25 (preserves exact error codes, tokens)
+        raw_query = f"{raw_subject} {raw_desc}"
+
+        # Cleaned text for vector search (better semantic embedding)
+        cleaned_query = clean_ticket_text(raw_subject, raw_desc)
 
         rlists = []
 
-        # ── Vector search (filtered by category + product) ──
+        # ── Vector search (cleaned text → better semantic match) ──
         try:
-            qv = self.embedder.embed_ticket(ticket)
+            qv = self.embedder.embed(cleaned_query)
             rlists.append(self.vector_store.search(
                 qv, top_k * 2,
                 category_filter=predicted_category,
@@ -94,16 +93,16 @@ class HybridRetriever:
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
 
-        # ── BM25 keyword search (filtered by category) ──
+        # ── BM25 keyword search (original text → exact token match) ──
         try:
             rlists.append(self.bm25.search(
-                query, top_k * 2,
+                raw_query, top_k * 2,
                 category_filter=predicted_category,
             ))
         except Exception as e:
             logger.error(f"BM25 failed: {e}")
 
-        # ── Graph-RAG (uses category + subcategory) ──
+        # ── Graph-RAG ──
         gc = {}
         if use_graph and self.graph and product and predicted_category:
             try:
@@ -122,34 +121,29 @@ class HybridRetriever:
         for r in fused:
             score = r.get("rrf_score", 0)
 
-            # Base quality signals (unchanged)
+            # Base quality signals
             if r.get("resolution_helpful"):
                 score *= 1.5
             if (r.get("satisfaction_score") or 0) >= 4:
                 score *= 1.3
 
-            # NEW: Subcategory match boost
-            # If the retrieved ticket has the same subcategory, it's much more relevant
+            # Subcategory match boost
             if predicted_subcategory and r.get("subcategory"):
                 if r["subcategory"] == predicted_subcategory:
-                    score *= 1.8  # strong boost — same fine-grained issue type
+                    score *= 1.8
                 elif r.get("category") == predicted_category:
-                    score *= 1.1  # mild boost — same category at least
+                    score *= 1.1
 
-            # NEW: Priority proximity boost
-            # Resolutions from similar-priority tickets are more applicable
-            # (a fix for a critical issue may not apply to a low-priority one)
+            # Priority proximity boost
             if predicted_priority and r.get("priority"):
                 adjacency = PRIORITY_ADJACENCY.get(predicted_priority, {})
                 pri_boost = adjacency.get(r["priority"], 0.5)
-                score *= (0.8 + 0.4 * pri_boost)  # range: 0.84 to 1.2
+                score *= (0.8 + 0.4 * pri_boost)
 
-            # NEW: Sentiment-aware boost
-            # If the customer is frustrated/angry, prioritize resolutions that
-            # previously resolved similar sentiment tickets with high satisfaction
+            # Sentiment-aware boost
             if predicted_sentiment in ("frustrated", "angry"):
                 if (r.get("satisfaction_score") or 0) >= 4:
-                    score *= 1.2  # prioritize proven crowd-pleasers
+                    score *= 1.2
                 if r.get("resolution_helpful"):
                     score *= 1.1
 
@@ -171,17 +165,28 @@ class HybridRetriever:
         }
 
     def index_tickets(self, tickets, batch_size=500):
-        """Build search indices from resolved tickets."""
+        """
+        Build search indices with dual representation.
+
+        - BM25: indexes ORIGINAL text (subject + description + resolution + error_logs)
+        - Vector: indexes CLEANED resolution text (noise stripped at index time)
+        """
         with_res = [t for t in tickets if t.get("resolution")]
         logger.info(f"Indexing {len(with_res)} resolved tickets...")
 
+        # BM25 gets original text — preserves exact tokens for keyword matching
         self.bm25.build_index(with_res)
 
-        texts = [" | ".join([t.get("subject", ""), t.get("resolution", "")]) for t in with_res]
-        embs = self.embedder.embed_batch(texts, batch_size=64)
+        # Vector search gets cleaned text — better semantic embeddings
+        cleaned_texts = []
+        for t in with_res:
+            clean_subj = (t.get("subject") or "").strip()
+            clean_res = clean_resolution_text(t.get("resolution", ""))
+            cleaned_texts.append(f"{clean_subj} | {clean_res}")
+
+        embs = self.embedder.embed_batch(cleaned_texts, batch_size=64)
         ids = [t["ticket_id"] for t in with_res]
 
-        # Include subcategory and priority in payloads for re-ranking
         payloads = [{
             "category": t.get("category"),
             "subcategory": t.get("subcategory"),
@@ -197,4 +202,4 @@ class HybridRetriever:
 
         self.vector_store.create_collection(vector_dim=embs.shape[1])
         self.vector_store.upsert_batch(ids, embs, payloads, batch_size)
-        logger.info("Indexing complete")
+        logger.info("Indexing complete (dual-representation: BM25=original, vector=cleaned)")
