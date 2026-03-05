@@ -348,6 +348,88 @@ make test
 
 ---
 
+## Deploying Without Retraining
+
+If you want to hand off the system so someone can run inference without retraining, you need to export four things: the trained model files, the ticket data (for ingestion), the Docker compose file, and the source code.
+
+### Step 1: Use host-mounted models (recommended)
+
+In `docker-compose.dgx.yml`, replace the Docker volume with a host directory:
+
+```yaml
+# Change this:
+volumes:
+  - model_cache:/app/models
+
+# To this:
+volumes:
+  - ./models:/app/models
+```
+
+After training, all model artifacts live in `./models/` on your host — no extraction needed.
+
+If you already trained with a Docker volume, copy the files out:
+
+```bash
+docker run --rm \
+  -v support-intelligence_model_cache:/src \
+  -v $(pwd):/dst \
+  busybox tar czf /dst/models.tar.gz -C /src .
+```
+
+### Step 2: What the recipient needs
+
+| Component | Required for | How to get it |
+|-----------|-------------|---------------|
+| Source code + Dockerfile + docker-compose.yml | Everything | Git clone / tarball |
+| `models/` directory | Classification (inference) | Exported from training host |
+| `data/raw/tickets.json` | Retrieval index + graph tables | Original data file |
+| Internet access (first run only) | HuggingFace model downloads | `all-MiniLM-L6-v2`, `ModernBERT-base` |
+
+### Step 3: Recipient setup
+
+```bash
+# 1. Place the files
+tar xzf models.tar.gz          # → ./models/catboost/ and ./models/transformer/
+cp tickets.json data/raw/
+
+# 2. Start infrastructure
+docker compose up -d
+
+# 3. Build retrieval indices (required — Qdrant + BM25 + graph tables)
+docker compose run --rm ingest
+
+# 4. Start API (models load from ./models/)
+docker compose up app
+```
+
+### What won't work without ingestion
+
+Classification works with just the model files — it only needs the saved CatBoost/transformer weights. But retrieval (the `/process` and `/search` endpoints) requires the Qdrant vector index, BM25 index, and PostgreSQL graph tables, which are built during ingestion. Without running `ingest`, classification returns predictions but retrieval returns empty results.
+
+### Offline deployment (no internet)
+
+On first load, the system downloads HuggingFace models (`sentence-transformers/all-MiniLM-L6-v2` for embeddings, `answerdotai/ModernBERT-base` for the transformer classifier). For air-gapped environments, pre-cache them:
+
+```bash
+# On a machine with internet:
+python3 -c "
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModel, AutoTokenizer
+SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+AutoModel.from_pretrained('answerdotai/ModernBERT-base')
+AutoTokenizer.from_pretrained('answerdotai/ModernBERT-base')
+"
+
+# Then copy the HuggingFace cache:
+tar czf hf_cache.tar.gz ~/.cache/huggingface/
+
+# On the target machine:
+tar xzf hf_cache.tar.gz -C ~/
+```
+
+---
+
 ## How the System Handles Streaming
 
 In production with 500+ tickets/day, the system monitors four drift signals independently:

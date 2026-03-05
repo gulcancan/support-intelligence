@@ -80,7 +80,7 @@ class _SingleTaskCatBoost:
     """One CatBoost classifier for a single task."""
 
     CAT_FEATURES = [
-        "product", "product_module", "customer_tier", #"priority",
+        "product", "product_module", "customer_tier", "priority",
         "severity", "channel", "environment", "region", "business_impact",
     ]
     NUM_FEATURES = [

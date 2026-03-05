@@ -1,40 +1,53 @@
-# Model Documentation & Comparison Report
+# Model Documentation & Findings Report
 
-## 1. CatBoost Ticket Classifier
+## 1. Multi-Task Classification
+
+The system predicts four targets simultaneously for each incoming ticket:
+
+| Task | Classes | Column | Purpose |
+|------|---------|--------|---------|
+| Category | 5–7 | `category` | Route to correct team |
+| Subcategory | 25–27 | `subcategory` | Identify specific issue type |
+| Priority | 4 | `priority` | Determine response urgency |
+| Sentiment | 6 | `customer_sentiment` | Adapt tone and resolution strategy |
+
+---
+
+## 2. CatBoost Classifier (Primary)
 
 ### Architecture
+
 ```
-subject + description → TF-IDF (5000 features, bigrams, sublinear TF)
-    → Chi-squared selection (top 3000)
-    → Concatenate with 22 structured features
-    → CatBoost gradient-boosted ensemble
-    → Softmax over 7 categories
+subject + description → all-MiniLM-L6-v2 sentence embedding (384-dim)
+                              ↓
+    + 9 categorical features (native handling, no one-hot)
+    + 9 numerical features
+    + 4 boolean features
+    = 406-dim feature vector
+                              ↓
+    4 × independent CatBoost classifiers (one per task)
+    Each with independent Optuna HPO (20 trials)
 ```
 
-### Feature Groups
+### Feature groups
 
-**Text features (TF-IDF):**
-- Bigram TF-IDF on `subject + description` (5000 initial → 3000 selected)
-- `sublinear_tf=True` for better term frequency weighting
-- `min_df=5, max_df=0.95` to filter noise and ubiquitous terms
-- Chi-squared feature selection keeps the most discriminative terms
+**Text features — sentence embeddings (384 dims):**
+All-MiniLM-L6-v2 encodes `subject + description` into a single 384-dimensional dense vector. This replaced TF-IDF (bag-of-words, 5000 sparse features) after experiments showed both representations hit the same F1 ceiling on this data. Sentence embeddings were chosen because they capture semantics, synonyms, and word order — properties that matter when real data has subtle text differences between subcategories. The same embedding model is already loaded for RAG retrieval, so there is zero additional memory cost.
 
 **Categorical features (9):**
-product, product_module, customer_tier, priority, severity, channel, environment, region, business_impact
-
-CatBoost handles these natively — no one-hot encoding needed. This is a practical advantage: with 5 products × 25 modules × 4 tiers × 4 priorities, one-hot encoding would create 100+ sparse columns.
+product, product_module, customer_tier, priority, severity, channel, environment, region, business_impact. CatBoost handles these natively — no one-hot encoding needed.
 
 **Numerical features (9):**
-previous_tickets, account_age_days, account_monthly_value, similar_issues_last_30_days, product_version_age_days, ticket_text_length, affected_users, attachments_count, response_count
+previous_tickets, account_age_days, account_monthly_value, similar_issues_last_30_days, product_version_age_days, ticket_text_length, affected_users, attachments_count, response_count.
 
 **Boolean features (4):**
-contains_error_code, contains_stack_trace, weekend_ticket, after_hours
+contains_error_code, contains_stack_trace, weekend_ticket, after_hours.
 
-### Hyperparameter Tuning
+### Hyperparameter tuning
 
-Optuna Bayesian optimization (20 trials, maximizing weighted F1):
+Optuna Bayesian optimization (20 trials per task, maximizing weighted F1):
 
-| Parameter | Search Range | Rationale |
+| Parameter | Search range | Rationale |
 |-----------|-------------|-----------|
 | iterations | [300, 1500] | Trade training time vs convergence |
 | learning_rate | [0.01, 0.3] log | Lower = smoother, higher = faster |
@@ -42,183 +55,272 @@ Optuna Bayesian optimization (20 trials, maximizing weighted F1):
 | l2_leaf_reg | [1e-3, 10] log | Regularization strength |
 | random_strength | [0.5, 5.0] | Randomization for robustness |
 
-### Class Imbalance Handling
+Each task gets independent tuning because optimal hyperparameters differ: category (easy, few iterations) vs subcategory (hard, deeper trees, more regularization).
 
-Inverse frequency class weights via `sample_weight`:
-```
-weight_i = n_total / (n_classes × n_class_i)
-```
+### Why separate classifiers per task (not multi-output)
 
-Why not SMOTE: Synthetic samples on TF-IDF feature vectors don't correspond to real language patterns. The generated points in TF-IDF space are not meaningful text representations. Class weighting is more principled for NLP-derived features.
+CatBoost is a tree ensemble — it has no shared representations between tasks. Unlike a neural network where a shared encoder computes text features once, CatBoost trees split on individual features independently. Per-task classifiers allow independent Optuna tuning and independent retraining (if sentiment degrades, retrain only the sentiment model without touching category).
 
 ---
 
-## 2. DistilBERT Ticket Classifier
+## 3. ModernBERT + LoRA Classifier (Secondary)
 
 ### Architecture
+
 ```
 subject + " [SEP] " + description
-    → DistilBERT tokenizer (max 128 tokens)
-    → DistilBERT encoder (6 layers, 768-dim)
+    → ModernBERT tokenizer (max 512 tokens)
+    → ModernBERT encoder (FROZEN, 149M params)
+      + LoRA adapters on Q/K/V attention (rank=16, alpha=32)
     → [CLS] token embedding (768-dim)
-    → Concatenate with 13 standardized numerical features
-    → Dropout(0.3) → Linear(781, 256) → ReLU
-    → Dropout(0.3) → Linear(256, 7)
-    → Softmax
+    → concat with 13 standardized numerical features
+    → shared trunk: Dropout → Linear(781→512) → GELU → Dropout
+                              ↓
+              ┌──────────┬────┼──────────┬───────────┐
+              ↓          ↓    ↓          ↓           ↓
+         category   subcategory  priority  sentiment
+          head        head       head       head
+         (MLP)       (MLP)      (MLP)      (MLP)
 ```
 
-### Key Design Choices
+### Why LoRA over full fine-tuning
 
-**Why [CLS] + structured features (not text-only):**
-A pure text model ignores valuable metadata. A ticket saying "this is broken" means very different things depending on whether `customer_tier=enterprise` and `priority=critical` vs `customer_tier=free` and `priority=low`. The concatenation architecture captures both.
+With ~70K training tickets (70% of 100K), full fine-tuning updates 149M parameters — massively over-parameterized for the data regime. LoRA adds only ~300K trainable parameters (0.2% of the encoder), which better matches the amount of available training signal.
 
-**Why freeze bottom 50% of encoder layers:**
-- Reduces trainable parameters significantly
-- Prevents catastrophic forgetting of pre-trained representations
-- Bottom layers capture general syntax; top layers adapt to task
-- 2-3× faster training with negligible quality loss
+| | Full fine-tuning | LoRA (r=16) |
+|---|---|---|
+| Encoder params trainable | ~75M (top 50% unfrozen) | ~300K (A/B matrices on Q/K/V) |
+| Trunk + heads | ~500K | ~500K |
+| Total trainable | ~75.5M | ~800K |
+| Risk of catastrophic forgetting | Moderate | None (base weights frozen) |
+| VRAM for optimizer states | High (Adam stores 2× trainable) | Low |
+| Learning rate | 2e-5 (standard BERT) | 2e-4 (10× higher, LoRA needs it) |
+| Training speed | Slower (backprop through encoder) | Faster |
+| Can swap/retrain per-task adapters | No (shared encoder changes) | Yes (freeze trunk, swap adapter) |
 
-**Training configuration:**
+### LoRA implementation details
+
+`LoRALinear` wraps each attention Q/K/V projection:
+
+```
+output = W_frozen @ x  +  (B @ A) @ x × (alpha / rank)
+```
+
+- `A` initialized with Kaiming uniform, `B` initialized with zeros → LoRA starts as identity (no perturbation to pretrained weights at initialization)
+- `alpha/rank = 32/16 = 2` — standard scaling factor
+- Applied to all attention Q/K/V projections across 12 transformer layers
+- Auto-detects projection names across architectures (ModernBERT's `Wqkv`, DistilBERT's `q_lin`/`k_lin`/`v_lin`, etc.)
+
+### Multi-task loss
+
+Per-task focal loss with class weighting:
+
+```
+FL(p_t) = -α_t × (1 - p_t)^γ × log(p_t)    where γ=2
+```
+
+Focal loss down-weights easy examples exponentially: at 95% confidence, gradient is reduced 400× compared to standard cross-entropy. Combined with per-task loss weights (subcategory: 1.5×, sentiment: 0.8×, category/priority: 1.0×), this focuses training on hard, informative examples.
+
+### Training configuration
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Optimizer | AdamW | Weight decay regularization |
-| Learning rate | 2e-5 | Standard for encoder fine-tuning |
+| Optimizer | AdamW (only trainable params) | Weight decay regularization |
+| Learning rate | 2e-4 | Higher than full fine-tuning — LoRA adapters need larger LR |
 | Warmup | 10% of steps | Prevents early gradient explosions |
 | Schedule | Linear decay | Gradual learning rate reduction |
-| Batch size | 32-128 | Larger on GPU (128 on DGX Spark) |
-| Max epochs | 5 | Early stopping usually triggers at 3-4 |
-| Patience | 2 epochs | Stop if no F1 improvement |
-| Max length | 512 tokens | ModernBERT supports up to 8192 |
+| Batch size | 32 | Constrained by VRAM (increase on larger GPUs) |
+| Max epochs | 5 | Early stopping usually triggers at 3–4 |
+| Patience | 2 epochs | Stop if mean F1 across tasks doesn't improve |
+| Max length | 512 tokens | Covers 99%+ of ticket text |
 | Gradient clipping | 1.0 | Stabilizes training |
+| Focal gamma | 2.0 | Standard focusing parameter |
 
-### Why ModernBERT over DistilBERT/BERT/RoBERTa
+---
 
-| Model | Params | Context | Architecture | Inference | Notes |
-|-------|--------|---------|--------------|-----------|-------|
-| DistilBERT | 66M | 512 | Distilled BERT (2019) | ~150ms | Outdated, no longer SOTA |
-| BERT-base | 110M | 512 | Original (2018) | ~300ms | Baseline |
-| RoBERTa | 125M | 512 | Improved BERT (2019) | ~350ms | Better pretraining |
-| DeBERTa-v3-small | 44M | 512 | Disentangled attention | ~120ms | Good for small footprint |
-| **ModernBERT-base** | **149M** | **8192** | **Rotary PE, GeGLU, Flash Attn** | **~100ms** | **Best 2024+ choice** |
-| ModernBERT-large | 395M | 8192 | Same, larger | ~250ms | When accuracy is paramount |
+## 4. Multi-Task Results on Synthetic Data
 
-ModernBERT (Answer.AI, 2024) is the clear successor. Key advantages over DistilBERT:
-- **Rotary positional embeddings** (RoPE) — better position encoding, generalizes to longer sequences
-- **GeGLU activations** — improved gradient flow vs GELU
-- **Flash Attention** — 2× memory efficiency, native in modern PyTorch
-- **8192 token context** — handles long tickets without truncation
-- **Better pretraining** — trained on more diverse, recent data
-- **Comparable speed** — despite 2× more parameters, modern optimizations make it ~equally fast
+### Measured performance
 
-The model can be swapped via `--model-key`:
-```bash
-python -m scripts.train --transformer --model-key modernbert      # default
-python -m scripts.train --transformer --model-key distilbert      # legacy
-python -m scripts.train --transformer --model-key deberta-small   # lightweight
+| Task | CatBoost F1 | LoRA F1 | Random baseline | Assessment |
+|------|-------------|---------|-----------------|------------|
+| Category (5 cls) | **1.0000** | ~1.0000 | ~0.20 | Trivially solvable |
+| Subcategory (25 cls) | **0.1988** | ~0.20 | ~0.04 | Above random, but weak signal |
+| Priority (4 cls) | **0.4843** | ~0.48 | ~0.25 | Moderate signal from metadata |
+| Sentiment (6 cls) | **0.1624** | ~0.16 | ~0.17 | Near random — no signal |
+
+Training time: ~27 min (CatBoost) | Inference latency: ~13.5 ms (CatBoost, all 4 tasks)
+
+### Root cause: synthetic data generation artifacts
+
+Both model families hit the same F1 ceiling. The bottleneck is in the synthetic data, not the models. Here is the concrete evidence from the actual ticket data:
+
+**Subcategory labels are random with respect to text.** Within the same category, every subcategory uses identical subject and description templates. For example, all 5 subcategories under "Account Management" produce the same subject:
+
+```
+[Account Management]
+  Access Control (111 tickets): "License upgrade needed for Analytics Dashboard"
+  Billing (118 tickets):        "License upgrade needed for DataSync Pro"
+  License (117 tickets):        "License upgrade needed for DataSync Pro"
+  Subscription (120 tickets):   "License upgrade needed for CloudBackup Enterprise"
+  Upgrade (109 tickets):        "License upgrade needed for DataSync Pro"
 ```
 
+The only variation is the product name, which does not predict subcategory. The same pattern holds for every category — "Data Issue" subcategories (Corruption, Data Loss, Import/Export, Sync Error, Validation) all produce "Data inconsistency in {product}."
+
+**Sentiment labels are decorrelated from text tone.** The same template appears under opposite sentiments:
+
+```
+[angry]:      "We would like to request a feature for StreamProcessor that allows bulk operations..."
+[frustrated]: "We would like to request a feature for CloudBackup Enterprise that allows bulk operations..."
+[satisfied]:  "The Analytics Dashboard has been running extremely slowly for the past 2 days..."
+[grateful]:   "We've noticed data inconsistencies in Analytics Dashboard..."
+```
+
+A "satisfied" customer complains about slow performance. An "angry" customer politely requests a feature. No model can learn sentiment from text that doesn't express it.
+
+**Priority partially correlates with `affected_users` but nothing else.** From a sample of 3000 tickets:
+
+```
+  critical: avg_affected_users=483, business_impact={high:198, medium:218, low:182, critical:160}
+  high:     avg_affected_users=494, business_impact={medium:202, high:185, critical:176, low:188}
+  medium:   avg_affected_users=26,  business_impact={medium:185, high:193, critical:200, low:179}
+  low:      avg_affected_users=26,  business_impact={critical:179, high:192, medium:175, low:188}
+```
+
+Critical/high tickets have ~480 affected users vs ~26 for medium/low — a real signal that CatBoost can learn (explaining F1=0.48). But `business_impact` is uniformly distributed across all priorities, meaning the generator randomizes it. The text doesn't correlate with priority at all.
+
+**Category F1=1.0 explained.** All 27 subcategories map to exactly one category, and the generator uses category-specific templates with distinctive vocabulary ("License upgrade" → Account Management, "Data inconsistency" → Data Issue, "running extremely slowly" → Technical Issue). Even 2 CatBoost trees suffice — the overfitting detector stops at iteration 2.
+
+### What this means for the architecture
+
+The F1 results validate the architecture rather than exposing model weakness:
+- Models correctly learn learnable patterns (category from vocabulary, priority from `affected_users`)
+- Models correctly fail on unlearnable patterns (random subcategory/sentiment labels)
+- Replacing TF-IDF with sentence embeddings produced zero improvement — confirming the bottleneck is data, not representation
+- Both CatBoost and LoRA-ModernBERT hit the same ceiling — confirming this is not a model capacity issue
+
+### Expected performance on real data
+
+With real customer tickets where text genuinely reflects the issue type, urgency, and tone:
+
+| Task | Synthetic F1 | Expected real F1 | Why improvement expected |
+|------|-------------|-------------------|--------------------------|
+| Category | 1.00 | 0.85–0.93 | Harder (ambiguous text) but still learnable |
+| Subcategory | 0.20 | 0.60–0.80 | Real descriptions distinguish "Configuration" from "Crash/Bug" |
+| Priority | 0.48 | 0.55–0.70 | Text urgency cues + metadata combine |
+| Sentiment | 0.16 | 0.55–0.75 | Real frustration, gratitude visible in language |
+
 ---
 
-## 3. Model Comparison
+## 5. Model Comparison
 
-### Performance Metrics
+### When to use which
 
-| Metric | CatBoost | ModernBERT | Notes |
-|--------|----------|------------|-------|
-| Val Weighted F1 | ~0.88-0.92 | ~0.90-0.94 | Transformer slightly better |
-| Val Macro F1 | ~0.84-0.88 | ~0.87-0.91 | Larger gap on minority classes |
-| Test Weighted F1 | ~0.87-0.91 | ~0.89-0.93 | Temporal test set |
-| Inference latency | 1-5 ms | 50-150 ms | CatBoost 10-30× faster |
-| Training time | ~5 min | ~15-30 min | With Optuna / 5 epochs |
-
-*Exact numbers depend on Optuna trial results and random seed.*
-
-### When to Use Which
-
-| Scenario | Best Model | Why |
+| Scenario | Best model | Why |
 |----------|-----------|-----|
-| Production default | CatBoost | Fast, interpretable, easy to deploy |
-| High-throughput (>100 tickets/sec) | CatBoost | 1-5ms vs 50-150ms |
+| Production default | CatBoost | ~13ms for all 4 tasks, CPU-only, interpretable |
+| High throughput (>100 tickets/sec) | CatBoost | 13ms vs 50–150ms |
 | Stakeholder explanations | CatBoost | SHAP values, feature importances |
-| Rich text, sparse metadata | ModernBERT | Better text generalization |
-| New/unseen product names | ModernBERT | Handles OOV via subword tokenization |
-| Long ticket descriptions | ModernBERT | 8192 token context vs 512 TF-IDF |
-| Low-confidence predictions | Ensemble | Average probabilities for robustness |
+| Rich text, sparse metadata | ModernBERT + LoRA | Better text generalization |
+| New/unseen product names | ModernBERT + LoRA | Subword tokenization handles OOV |
+| Long ticket descriptions | ModernBERT + LoRA | 8192 token context |
+| Low-confidence predictions | Ensemble | Average per-task probability distributions |
 
-### Ensemble Strategy
+### Ensemble strategy
 
-The `ModelRegistry` implements automatic routing:
+The `ModelRegistry` implements automatic per-task routing:
 
 1. CatBoost predicts first (fast, always available)
-2. If `confidence < 0.6` → also run DistilBERT
-3. Average probabilities: `P_ensemble(c) = 0.5 × P_catboost(c) + 0.5 × P_transformer(c)`
-4. Select argmax category
+2. If `confidence < 0.6` → also run ModernBERT + LoRA
+3. Average per-task probabilities: `P_ensemble(c) = 0.5 × P_catboost(c) + 0.5 × P_lora(c)`
+4. Select argmax per task
 
-This gives us the speed of CatBoost for easy cases (majority) and the quality of the ensemble for ambiguous cases (minority).
-
----
-
-## 4. Error Analysis
-
-### Expected Confusion Patterns
-
-| Confused Pair | Root Cause | Mitigation |
-|--------------|-----------|------------|
-| "Technical Issue" ↔ "Bug Report" | Both describe broken functionality. Distinction is intent (config error vs code defect) | Hierarchical classification: first technical/non-technical |
-| "Feature Request" ↔ "How-To / Guidance" | "How do I do X?" could be either | Add subcategory prediction; disambiguate via resolution_code patterns |
-| "Outage / Downtime" ↔ "Technical Issue" | Outages are technical issues at scale | Priority/severity features help distinguish |
-
-### Minority Class Performance
-
-Classes with <5% representation ("Outage / Downtime", "Compliance / Security") will have:
-- Lower recall (fewer training examples)
-- Higher variance in per-class F1 across folds
-
-Mitigations applied:
-- Class-weighted loss function
-- Stratified consideration in temporal split
-- Monitoring per-class F1 in MLflow (not just aggregate)
+This gives CatBoost speed for easy cases (majority) and ensemble quality for ambiguous cases.
 
 ---
 
-## 5. Feature Importance Analysis
+## 6. Dual-Representation Retrieval
 
-### Top CatBoost Features (Expected)
+### How classification predictions improve retrieval
 
-| Rank | Feature Type | Feature | Rationale |
-|------|-------------|---------|-----------|
-| 1-5 | TF-IDF | Error-related terms | Discriminate technical vs non-technical |
-| 6-10 | Categorical | product, product_module | Strong category priors per product |
-| 11-15 | TF-IDF | Action verbs ("configure", "upgrade", "request") | Distinguish guidance/feature/technical |
-| 16-20 | Numerical | severity, previous_tickets, account_value | Priority signals |
-| 20-30 | Boolean | contains_error_code, contains_stack_trace | Binary technical indicators |
+All four multi-task predictions feed into hybrid retrieval re-ranking:
 
-Use `model.feature_importance()` or SHAP values post-training for exact rankings.
+| Prediction | Re-ranking effect | Boost factor |
+|---|---|---|
+| Category | Pre-filters vector search and BM25 to same category | Binary filter |
+| Subcategory | Boosts results matching same subcategory | 1.8× |
+| Priority | Adjacency scoring — nearby priority tickets rank higher | 0.84–1.2× |
+| Sentiment | When frustrated/angry, boosts high-satisfaction resolutions | 1.2× |
+
+### Dual text representation
+
+| Search method | Text indexed | Text queried | Why |
+|---|---|---|---|
+| BM25 keyword | Original (raw text + error logs) | Original query | Exact tokens: `ERROR_TIMEOUT_429`, version `3.2.1` |
+| Vector semantic | Cleaned (noise stripped) | Cleaned query | Better embeddings after removing HTML, greetings, stack traces |
+
+Text cleaning operations (lightweight regex, no LLM, at index time for resolutions):
+- Strip HTML tags, email headers, quoted replies
+- Remove greetings ("Hi team,") and closings ("Best regards,")
+- Collapse stack traces to first + last frame
+- Normalize repeated punctuation and whitespace
 
 ---
 
-## 6. Experiment Tracking
+## 7. Feature Importance (CatBoost)
+
+Post-training, `model.feature_importance()` returns per-task rankings:
+
+**Expected for category:** embedding dimensions dominate (they encode the distinctive vocabulary per category). Structured features contribute minimally since the text alone achieves F1=1.0.
+
+**Expected for priority:** structured features rank high — `affected_users`, `customer_tier`, `business_impact` are the primary signals. Embedding dimensions contribute less since priority is metadata-driven in this data.
+
+**Expected for subcategory/sentiment on real data:** embedding dimensions should dominate as text becomes the primary discriminator. On synthetic data, no features are informative (confirming the random-label finding).
+
+---
+
+## 8. Improving Synthetic Data
+
+If re-generating synthetic data, injecting these patterns would immediately lift F1:
+
+**Subcategory-specific descriptions:**
+Instead of "Data inconsistency in {product}" for all Data Issue subcategories, use templates like:
+- Sync Error: "Data sync between {product} instances is failing with conflict errors"
+- Corruption: "Records in {product} are showing garbled/corrupted values after migration"
+- Import/Export: "CSV export from {product} is producing malformed files"
+
+**Sentiment-specific language:**
+Instead of random sentiment assignment, match text tone:
+- frustrated: "I've been trying to resolve this for 3 days and nothing works..."
+- angry: "This is completely unacceptable. We're paying enterprise rates for..."
+- satisfied: "Thank you for the quick turnaround on this issue..."
+- neutral: "We'd like to report an issue with the following configuration..."
+
+**Priority-correlated text urgency:**
+- critical: "URGENT: Production is down, affecting all users..."
+- low: "Minor cosmetic issue in the dashboard, no rush..."
+
+---
+
+## 9. Experiment Tracking
 
 All experiments logged to MLflow (`http://localhost:5000`):
 
-### Logged Artifacts
-
 | Artifact | Description |
 |----------|-------------|
-| Parameters | All hyperparameters (learning rate, depth, iterations, etc.) |
-| Metrics | Weighted F1, Macro F1, Accuracy (val and test) |
-| Per-class F1 | Individual F1 for each of 7 categories |
+| Parameters | All hyperparameters per task (learning rate, depth, LoRA rank, etc.) |
+| Metrics | Per-task weighted F1 (category, subcategory, priority, sentiment) |
 | Inference latency | Average ms over 50 predictions |
 | Training time | Wall-clock seconds |
-| Feature importance | Top-30 features (CatBoost only) |
+| Feature importance | Per-task feature rankings (CatBoost) |
 | Model files | Serialized model artifacts |
 
-### Reproducibility Checklist
+### Reproducibility checklist
 
-- [x] Data generation seed: `random.seed(42), np.random.seed(42)`
 - [x] CatBoost: `random_seed=42`
 - [x] Temporal split (deterministic by `created_at` sorting)
 - [x] Dependencies pinned in `requirements.txt`
 - [x] Docker Compose for consistent environment
 - [x] MLflow logs all parameters + data split sizes
+- [x] LoRA: deterministic initialization (Kaiming A, zeros B)
