@@ -131,7 +131,7 @@ def main():
     except Exception as e:
         logger.info(f"GPU check failed: {e} — will detect at training time")
 
-    if args.both: args.catboost = args.transformer = True
+    if args.both: ar = args.transformer = True
     if not args.catboost and not args.transformer: args.catboost = True
     tr, val, te = load_and_split(args.data); results = []
     if args.catboost: results.append(train_catboost(tr,val,te,f"{args.model_dir}/catboost",args.optuna_trials))

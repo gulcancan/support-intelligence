@@ -301,6 +301,28 @@ Instead of random sentiment assignment, match text tone:
 - critical: "URGENT: Production is down, affecting all users..."
 - low: "Minor cosmetic issue in the dashboard, no rush..."
 
+### Alternative: LLM label distillation
+
+Rather than re-generating synthetic data, we can correct the existing labels using a strong open-source foundation model (Qwen2.5-72B, Llama 3.1-70B) running locally. This is implemented in `scripts/correct_labels.py`.
+
+The approach prompts the LLM with the full ticket context — not just subject and description, but also error logs, resolution text, customer feedback, escalation reason, affected users, customer tier, environment, and tags. The model infers what the subcategory, priority, and sentiment *should* be based on the actual content, then we replace the random labels with the LLM's predictions.
+
+**Why this works well:**
+- Sentiment is near-trivial for a foundation model (F1 ~0.85–0.95 expected) — text tone is exactly what LLMs understand
+- Subcategory benefits from resolution text and error logs that the original generator ignored when assigning labels
+- Priority can be inferred from affected users + urgency language + escalation status
+- Category labels are NOT corrected — they already achieve F1=1.0
+
+**Why open-source and local:**
+- Zero API cost for 100K tickets (vs ~$100–200 for Claude/GPT-4 API)
+- No rate limits — vLLM with continuous batching achieves 3–8 tickets/sec
+- Full data privacy — tickets never leave the machine
+- Reproducible — same model weights, temperature=0.1 for deterministic outputs
+
+**Estimated time:** 4–9 hours for 100K tickets on a DGX Spark with Qwen2.5-72B-AWQ via vLLM. Checkpointing every 50 tickets makes it safe to interrupt and resume.
+
+See `README.md → Label Correction via LLM Distillation` for setup instructions.
+
 ---
 
 ## 9. Experiment Tracking

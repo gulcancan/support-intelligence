@@ -68,6 +68,8 @@ The current synthetic dataset has a structural limitation: **subcategory, priori
 
 Category prediction achieves F1=1.0 because the synthetic generator uses category-specific templates with distinctive vocabulary. On real data where customers describe actual issues, subcategory and sentiment F1 should improve substantially (estimated 0.60–0.80).
 
+**Mitigation: LLM label distillation.** Rather than accepting the random labels, we provide a script (`scripts/correct_labels.py`) that uses a strong open-source foundation model (Qwen2.5-72B via vLLM) running locally to re-label all tickets. The LLM sees the full ticket context — description, error logs, resolution, feedback, metadata — and infers what the labels should actually be. This is a one-time cost (~4–9 hours for 100K tickets on a DGX Spark) that transforms the dataset quality without manual labeling. See the "Label Correction via LLM Distillation" section under Reproducing Results for setup instructions.
+
 ### Drift Monitoring and Retraining
 
 Four independent drift signals are monitored, ordered by detection speed:
@@ -265,7 +267,8 @@ support-intelligence/
 ├── scripts/
 │   ├── init_db.sql           # Database schema (tickets, features, graph, feedback)
 │   ├── run_ingest.py         # Full ingestion pipeline runner
-│   └── train.py              # Multi-task training: CatBoost + LoRA transformer
+│   ├── train.py              # Multi-task training: CatBoost + LoRA transformer
+│   └── correct_labels.py    # LLM distillation: re-label subcategory/priority/sentiment
 ├── src/
 │   ├── config.py             # Centralized Pydantic settings
 │   ├── db.py                 # SQLAlchemy connection management
@@ -335,6 +338,60 @@ View results in MLflow: http://localhost:5000
 | Sentiment (6 cls) | ~0.16 | ~0.16 | ~0.17 |
 
 Subcategory and sentiment F1 are bounded by synthetic data quality (labels don't correlate with text). See [docs/model-report.md](docs/model-report.md) for the full findings report and expected real-data performance.
+
+### Label Correction via LLM Distillation (Optional)
+
+The synthetic data generator assigns subcategory, priority, and sentiment labels essentially at random — the same text template appears under opposite sentiments, and different subcategories within a category are indistinguishable. To fix this without manual labeling, we use a strong open-source foundation model (Qwen2.5-72B) running locally to re-label all tickets based on the full ticket context (description, error logs, resolution, metadata, feedback).
+
+**Step 1: Start a local LLM server** (on a machine with a large GPU, e.g. DGX Spark)
+
+```bash
+# Using NVIDIA's vLLM container (recommended)
+docker run -it --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -p 8001:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  nvcr.io/nvidia/vllm:26.02-py3 \
+  vllm serve "Qwen/Qwen2.5-72B-Instruct-AWQ" \
+  --gpu-memory-utilization 0.85
+
+# Check which model name vLLM registered:
+curl http://localhost:8001/v1/models
+# Use the "id" field from the response as --model below
+```
+
+If `Qwen2.5-72B` doesn't fit in memory, use `Qwen/Qwen2.5-32B-Instruct-AWQ` instead — still very capable for label correction.
+
+**Step 2: Run label correction** (checkpoints every 50 tickets — safe to interrupt and resume)
+
+```bash
+python scripts/correct_labels.py \
+  --data data/raw/tickets.json \
+  --output data/raw/tickets_corrected.json \
+  --backend vllm \
+  --base-url http://localhost:8001 \
+  --model "Qwen/Qwen2.5-72B-Instruct-AWQ"
+```
+
+At ~3–8 tickets/sec with vLLM, 100K tickets takes roughly 4–9 hours. The script prompts the LLM with every available ticket field (subject, description, error logs, resolution, feedback, escalation reason, affected users, customer tier, etc.) to infer the most accurate labels.
+
+**Step 3: Spot-check before committing**
+
+```bash
+python scripts/correct_labels.py --spot-check 200 \
+  --output data/raw/tickets_corrected.json \
+  --data data/raw/tickets.json
+```
+
+This prints 200 random before/after diffs for manual review.
+
+**Step 4: Retrain on corrected data**
+
+```bash
+python scripts/train.py --data data/raw/tickets_corrected.json --both
+```
+
+Expected improvement: subcategory F1 0.20 → 0.55–0.75, sentiment F1 0.16 → 0.50–0.70, priority F1 0.48 → 0.55–0.65.
 
 ### Running Tests
 
